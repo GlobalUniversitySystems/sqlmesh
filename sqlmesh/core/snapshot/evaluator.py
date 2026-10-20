@@ -24,39 +24,38 @@ from __future__ import annotations
 
 import abc
 import logging
-import typing as t
 import sys
+import typing as t
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import reduce
 
 from sqlglot import exp, select
 from sqlglot.executor import execute
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.audit import Audit, StandaloneAudit
 from sqlmesh.core.dialect import schema_
-from sqlmesh.core.engine_adapter.shared import InsertOverwriteStrategy, DataObjectType, DataObject
-from sqlmesh.core.model.meta import GrantsTargetLayer
+from sqlmesh.core.engine_adapter.shared import DataObject, DataObjectType, InsertOverwriteStrategy
 from sqlmesh.core.macros import RuntimeStage
 from sqlmesh.core.model import (
     AuditResult,
+    CustomKind,
     IncrementalUnmanagedKind,
     Model,
-    SeedModel,
     SCDType2ByColumnKind,
     SCDType2ByTimeKind,
+    SeedModel,
     ViewKind,
-    CustomKind,
 )
-from sqlmesh.core.model.kind import _Incremental, DbtCustomKind
-from sqlmesh.utils import CompletionStatus, columns_to_types_all_known
+from sqlmesh.core.model.kind import DbtCustomKind, _Incremental
+from sqlmesh.core.model.meta import GrantsTargetLayer
 from sqlmesh.core.schema_diff import (
-    has_drop_alteration,
     TableAlterOperation,
     has_additive_alteration,
+    has_drop_alteration,
 )
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
@@ -68,21 +67,27 @@ from sqlmesh.core.snapshot import (
     SnapshotTableCleanupTask,
 )
 from sqlmesh.core.snapshot.execution_tracker import QueryExecutionTracker
-from sqlmesh.utils import random_id, CorrelationId, AttributeDict
+from sqlmesh.utils import (
+    AttributeDict,
+    CompletionStatus,
+    CorrelationId,
+    columns_to_types_all_known,
+    random_id,
+)
 from sqlmesh.utils.concurrency import (
+    NodeExecutionFailedError,
     concurrent_apply_to_snapshots,
     concurrent_apply_to_values,
-    NodeExecutionFailedError,
 )
 from sqlmesh.utils.date import TimeLike, now, time_like_to_str
 from sqlmesh.utils.errors import (
+    AdditiveChangeError,
     ConfigError,
     DestructiveChangeError,
     MigrationNotSupportedError,
     SQLMeshError,
-    format_destructive_change_msg,
     format_additive_change_msg,
-    AdditiveChangeError,
+    format_destructive_change_msg,
 )
 from sqlmesh.utils.jinja import MacroReturnVal
 
@@ -1338,7 +1343,7 @@ class SnapshotEvaluator:
                 )
             ),
         ):
-            _evaluation_strategy(snapshot, adapter).demote(view_name)
+            _evaluation_strategy(snapshot, adapter).demote(view_name, model=snapshot.model)
 
         if on_complete is not None:
             on_complete(snapshot)
@@ -2006,6 +2011,18 @@ class PromotableStrategy(EvaluationStrategy, abc.ABC):
         environment: str,
         **kwargs: t.Any,
     ) -> None:
+        print(f"In evaluator promote view_name - {view_name}. table_name = {table_name}")
+        print("model.virtual_environment_mode", model.virtual_environment_mode)
+        view_name_normalized = exp.to_table(view_name).sql(
+            dialect=self.adapter.dialect, identify=True
+        )
+        if table_name == view_name_normalized or table_name == view_name:
+            print(
+                "In evaluator promote. Skipping virtual view creation since it matches the physical table name '%s'",
+                view_name_normalized,
+            )
+            return
+
         is_prod = environment == c.PROD
         logger.info("Updating view '%s' to point at table '%s'", view_name, table_name)
         render_kwargs: t.Dict[str, t.Any] = dict(
@@ -2039,7 +2056,9 @@ class PromotableStrategy(EvaluationStrategy, abc.ABC):
 
     def demote(self, view_name: str, **kwargs: t.Any) -> None:
         logger.info("Dropping view '%s'", view_name)
-        self.adapter.drop_view(view_name, cascade=False)
+        model: Model = kwargs.get("model")
+        is_materialized_view = self._is_materialized_view(model)
+        self.adapter.drop_view(view_name, materialized=is_materialized_view, cascade=True)
 
     def run_pre_statements(self, snapshot: Snapshot, render_kwargs: t.Any) -> None:
         self.adapter.execute(snapshot.model.render_pre_statements(**render_kwargs))

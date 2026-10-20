@@ -11,11 +11,11 @@ from sqlmesh.core.engine_adapter.base import MERGE_SOURCE_ALIAS, MERGE_TARGET_AL
 from sqlmesh.core.engine_adapter.base_postgres import BasePostgresEngineAdapter
 from sqlmesh.core.engine_adapter.mixins import (
     GetCurrentCatalogFromFunctionMixin,
-    NonTransactionalTruncateMixin,
-    VarcharSizeWorkaroundMixin,
-    RowDiffMixin,
-    logical_merge,
     GrantsFromInfoSchemaMixin,
+    NonTransactionalTruncateMixin,
+    RowDiffMixin,
+    VarcharSizeWorkaroundMixin,
+    logical_merge,
 )
 from sqlmesh.core.engine_adapter.shared import (
     CommentCreationView,
@@ -30,7 +30,7 @@ if t.TYPE_CHECKING:
     import pandas as pd
 
     from sqlmesh.core._typing import SchemaName, TableName
-    from sqlmesh.core.engine_adapter.base import QueryOrDF, Query
+    from sqlmesh.core.engine_adapter.base import Query, QueryOrDF
     from sqlmesh.core.node import IntervalUnit
 
 logger = logging.getLogger(__name__)
@@ -48,10 +48,11 @@ class RedshiftEngineAdapter(
     DIALECT = "redshift"
     CURRENT_CATALOG_EXPRESSION = exp.func("current_database")
     # Redshift doesn't support comments for VIEWs WITH NO SCHEMA BINDING (which we always use)
-    COMMENT_CREATION_VIEW = CommentCreationView.UNSUPPORTED
+    COMMENT_CREATION_VIEW = CommentCreationView.COMMENT_COMMAND_ONLY
     SUPPORTS_REPLACE_TABLE = False
     SUPPORTS_GRANTS = True
     SUPPORTS_MULTIPLE_GRANT_PRINCIPALS = True
+    SUPPORTS_MATERIALIZED_VIEWS = True
 
     SCHEMA_DIFFER_KWARGS = {
         "parameterized_type_defaults": {
@@ -229,27 +230,44 @@ class RedshiftEngineAdapter(
         swap tables out from under views. Therefore, we create the view as non-binding.
         """
         no_schema_binding = True
-        if isinstance(query_or_df, exp.Expr):
-            # We can't include NO SCHEMA BINDING if the query has a recursive CTE
-            has_recursive_cte = any(
-                w.args.get("recursive", False) for w in query_or_df.find_all(exp.With)
-            )
-            no_schema_binding = not has_recursive_cte
+        # Redshift materialized views do not support NO SCHEMA BINDING
+        print(f"""Entered create_view.  
+        view_name: {view_name},
+        query_or_df: {query_or_df},
+        target_columns_to_types: {target_columns_to_types},
+        replace: = {replace},
+        materialized:  = {materialized},
+        materialized_properties:  = {materialized_properties},
+        table_description:  = {table_description},
+        column_descriptions:  = {column_descriptions},
+        view_properties:  = {view_properties},
+        source_columns:  = {source_columns},
+        **create_kwargs: {create_kwargs}""")
 
-        return super().create_view(
-            view_name,
-            query_or_df,
-            target_columns_to_types,
-            replace,
-            materialized,
-            materialized_properties,
-            table_description=table_description,
-            column_descriptions=column_descriptions,
-            no_schema_binding=no_schema_binding,
-            view_properties=view_properties,
-            source_columns=source_columns,
-            **create_kwargs,
-        )
+        view_name_normalized = exp.to_table(view_name).sql(dialect=self.dialect, identify=True)
+        print("view_name_normalized", view_name_normalized)
+
+        drop_sql_query = f"DROP VIEW IF EXISTS {view_name_normalized} CASCADE;"
+        create_sql_query = f"""CREATE VIEW {view_name_normalized} AS {query_or_df}
+        WITH NO SCHEMA BINDING;
+        """
+
+        if materialized:
+            drop_sql_query = f"DROP MATERIALIZED VIEW IF EXISTS {view_name_normalized} CASCADE;"
+            create_sql_query = f"""CREATE MATERIALIZED VIEW {view_name_normalized}
+                    AUTO REFRESH YES AS {query_or_df};
+                    """
+        self.execute(drop_sql_query)
+        self.execute(create_sql_query)
+        # Register table comment with commands if the engine doesn't support doing it in CREATE
+        if (
+            table_description
+            and self.COMMENT_CREATION_VIEW.is_comment_command_only
+            and self.comments_enabled
+        ):
+            self._create_table_comment(view_name, table_description, "VIEW")
+
+        self._clear_data_object_cache(view_name)
 
     def _build_table_properties_exp(
         self,

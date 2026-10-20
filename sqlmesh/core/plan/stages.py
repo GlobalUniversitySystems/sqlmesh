@@ -1,19 +1,19 @@
 import typing as t
-
 from dataclasses import dataclass
+
 from sqlmesh.core import constants as c
-from sqlmesh.core.environment import EnvironmentStatements, EnvironmentNamingInfo, Environment
+from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
 from sqlmesh.core.plan.common import should_force_rebuild
 from sqlmesh.core.plan.definition import EvaluatablePlan
-from sqlmesh.core.state_sync import StateReader
-from sqlmesh.core.scheduler import merged_missing_intervals, SnapshotToIntervals
+from sqlmesh.core.scheduler import SnapshotToIntervals, merged_missing_intervals
 from sqlmesh.core.snapshot.definition import (
     DeployabilityIndex,
     Snapshot,
-    SnapshotTableInfo,
     SnapshotId,
+    SnapshotTableInfo,
     snapshots_to_dag,
 )
+from sqlmesh.core.state_sync import StateReader
 from sqlmesh.utils.errors import PlanError
 
 
@@ -506,7 +506,11 @@ class PlanStagesBuilder:
         def _should_update_virtual_layer(snapshot: SnapshotTableInfo) -> bool:
             # Skip virtual layer update for snapshots with virtual environment support disabled
             virtual_environment_enabled = is_dev or snapshot.virtual_environment_mode.is_full
-            return snapshot.is_model and not snapshot.is_symbolic and virtual_environment_enabled
+            return (
+                snapshot.is_model
+                and not snapshot.is_symbolic
+                and (virtual_environment_enabled or not snapshot.is_materialized)
+            )
 
         promoted_snapshots = {s for s in promoted_snapshots if _should_update_virtual_layer(s)}
         demoted_snapshots = {s for s in demoted_snapshots if _should_update_virtual_layer(s)}
